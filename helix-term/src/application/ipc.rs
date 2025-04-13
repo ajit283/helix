@@ -1,39 +1,32 @@
-use interprocess::local_socket::tokio::prelude::*;
-use interprocess::local_socket::{
-    GenericFilePath, tokio::Stream,  ListenerOptions,
-};
-use helix_event::{register_hook};
-use crate::{
-    events::OnModeSwitch,
-};
+use crate::events::OnModeSwitch;
+use helix_event::register_hook;
 use helix_view::document::Mode;
+use interprocess::local_socket::tokio::prelude::*;
+use interprocess::local_socket::{tokio::Stream, GenericFilePath, ListenerOptions};
 use std::io;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 
-
-
 pub async fn start_ipc_server(sender: UnboundedSender<PathBuf>) -> io::Result<()> {
     let pid = std::process::id();
     let socket_path = format!("/tmp/helix-{}.sock", pid);
     // let socket_path = "/tmp/helix.sock";
-    let name = socket_path.to_fs_name::<GenericFilePath>().expect("Failed to resolve socket name");
+    let name = socket_path
+        .to_fs_name::<GenericFilePath>()
+        .expect("Failed to resolve socket name");
 
     let meta_path = format!("/tmp/helix-{}.meta", pid);
     std::fs::write(&meta_path, "")?;
 
     register_hook!(move |event: &mut OnModeSwitch<'_, '_>| {
-            if event.old_mode == Mode::Insert {
-                let path = meta_path.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = tokio::fs::write(path, "").await {
-                        eprintln!("meta write error: {e}");
-                    }
-                });
+        if event.old_mode == Mode::Insert {
+            if let Err(e) = std::fs::write(&meta_path, "") {
+                eprintln!("meta write error: {e}");
             }
-            Ok(())
-        });    
+        }
+        Ok(())
+    });
 
     let opts = ListenerOptions::new().name(name);
 
@@ -61,7 +54,8 @@ pub async fn start_ipc_server(sender: UnboundedSender<PathBuf>) -> io::Result<()
         }
     });
 
-    Ok(())}
+    Ok(())
+}
 
 async fn handle_conn(conn: Stream, sender: UnboundedSender<PathBuf>) -> io::Result<()> {
     let mut reader = BufReader::new(conn);
@@ -73,7 +67,8 @@ async fn handle_conn(conn: Stream, sender: UnboundedSender<PathBuf>) -> io::Resu
         sender.send(path).ok(); // Ignore failure to send
     }
 
-    Ok(())}
+    Ok(())
+}
 
 pub fn cleanup_ipc_artifacts() {
     let pid = std::process::id();
