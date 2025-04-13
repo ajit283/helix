@@ -1,3 +1,4 @@
+mod ipc;
 use arc_swap::{access::Map, ArcSwap};
 use futures_util::Stream;
 use helix_core::{diagnostic::Severity, pos_at_coords, syntax, Range, Selection};
@@ -17,6 +18,7 @@ use helix_view::{
     Align, Editor,
 };
 use serde_json::json;
+use std::path::PathBuf;
 use tui::backend::Backend;
 
 use crate::{
@@ -68,6 +70,8 @@ pub struct Application {
     signals: Signals,
     jobs: Jobs,
     lsp_progress: LspProgressMap,
+
+    ipc_rx: tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
 }
 
 #[cfg(feature = "integration")]
@@ -131,6 +135,13 @@ impl Application {
         let editor_view = Box::new(ui::EditorView::new(Keymaps::new(keys)));
         compositor.push(editor_view);
 
+        let (ipc_tx, ipc_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        tokio::spawn(async move {
+            if let Err(err) = ipc::start_ipc_server(ipc_tx).await {
+                eprintln!("IPC server failed to start: {}", err);
+            }
+        });
         if args.load_tutor {
             let path = helix_loader::runtime_file(Path::new("tutor"));
             editor.open(&path, Action::VerticalSplit)?;
@@ -242,6 +253,7 @@ impl Application {
             signals,
             jobs: Jobs::new(),
             lsp_progress: LspProgressMap::new(),
+            ipc_rx,
         };
 
         Ok(app)
@@ -305,46 +317,54 @@ impl Application {
             use futures_util::StreamExt;
 
             tokio::select! {
-                biased;
+                            biased;
 
-                Some(signal) = self.signals.next() => {
-                    if !self.handle_signals(signal).await {
-                        return false;
-                    };
-                }
-                Some(event) = input_stream.next() => {
-                    self.handle_terminal_events(event).await;
-                }
-                Some(callback) = self.jobs.callbacks.recv() => {
-                    self.jobs.handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(callback)));
-                    self.render().await;
-                }
-                Some(msg) = self.jobs.status_messages.recv() => {
-                    let severity = match msg.severity{
-                        helix_event::status::Severity::Hint => Severity::Hint,
-                        helix_event::status::Severity::Info => Severity::Info,
-                        helix_event::status::Severity::Warning => Severity::Warning,
-                        helix_event::status::Severity::Error => Severity::Error,
-                    };
-                    // TODO: show multiple status messages at once to avoid clobbering
-                    self.editor.status_msg = Some((msg.message, severity));
-                    helix_event::request_redraw();
-                }
-                Some(callback) = self.jobs.wait_futures.next() => {
-                    self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback);
-                    self.render().await;
-                }
-                event = self.editor.wait_event() => {
-                    let _idle_handled = self.handle_editor_event(event).await;
 
-                    #[cfg(feature = "integration")]
-                    {
-                        if _idle_handled {
-                            return true;
-                        }
-                    }
+                            Some(signal) = self.signals.next() => {
+                                if !self.handle_signals(signal).await {
+                                    return false;
+                                };
+                            }
+
+                            Some(event) = input_stream.next() => {
+                                self.handle_terminal_events(event).await;
+                            }
+                            Some(callback) = self.jobs.callbacks.recv() => {
+                                self.jobs.handle_callback(&mut self.editor, &mut self.compositor, Ok(Some(callback)));
+                                self.render().await;
+                            }
+                            Some(msg) = self.jobs.status_messages.recv() => {
+                                let severity = match msg.severity{
+                                    helix_event::status::Severity::Hint => Severity::Hint,
+                                    helix_event::status::Severity::Info => Severity::Info,
+                                    helix_event::status::Severity::Warning => Severity::Warning,
+                                    helix_event::status::Severity::Error => Severity::Error,
+                                };
+                                // TODO: show multiple status messages at once to avoid clobbering
+                                self.editor.status_msg = Some((msg.message, severity));
+                                helix_event::request_redraw();
+                            }
+                            Some(callback) = self.jobs.wait_futures.next() => {
+                                self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback);
+                                self.render().await;
+                            }
+                            event = self.editor.wait_event() => {
+                                let _idle_handled = self.handle_editor_event(event).await;
+
+                                #[cfg(feature = "integration")]
+                                {
+                                    if _idle_handled {
+                                        return true;
+                                    }
+                                }
+                            }
+            Some(path) = self.ipc_rx.recv() => {
+                match self.editor.open(&path, helix_view::editor::Action::Replace) {
+                    Ok(_) => self.render().await,
+                    Err(err) => eprintln!("❌ Failed to open file from IPC: {}", err),
                 }
             }
+                        }
 
             // for integration tests only, reset the idle timer after every
             // event to signal when test events are done processing
@@ -1124,6 +1144,8 @@ impl Application {
         let close_errs = self.close().await;
 
         self.restore_term()?;
+
+        ipc::cleanup_ipc_artifacts();
 
         for err in close_errs {
             self.editor.exit_code = 1;

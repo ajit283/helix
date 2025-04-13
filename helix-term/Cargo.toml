@@ -87,6 +87,8 @@ toml = "0.8"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 
+interprocess = { version = "2.0", features = ["tokio"] }
+
 # ripgrep for global search
 grep-regex = "0.1.13"
 grep-searcher = "0.1.14"
