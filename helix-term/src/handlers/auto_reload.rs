@@ -44,8 +44,14 @@ impl AutoReloadHandler {
             return;
         }
 
+        log::info!("auto-reload: initializing file watcher");
         let watcher = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
             if let Ok(event) = res {
+                log::trace!(
+                    "auto-reload: notify event kind={:?} paths={:?}",
+                    event.kind,
+                    event.paths
+                );
                 if matches!(
                     event.kind,
                     notify::EventKind::Modify(_) | notify::EventKind::Create(_)
@@ -59,8 +65,11 @@ impl AutoReloadHandler {
         });
 
         match watcher {
-            Ok(w) => self.watcher = Some(w),
-            Err(e) => log::warn!("Failed to create file watcher for auto-reload: {}", e),
+            Ok(w) => {
+                log::info!("auto-reload: file watcher ready");
+                self.watcher = Some(w);
+            }
+            Err(e) => log::warn!("auto-reload: failed to create file watcher: {}", e),
         }
     }
 }
@@ -77,23 +86,27 @@ impl helix_event::AsyncHook for AutoReloadHandler {
             AutoReloadEvent::Register { doc_id, path } => {
                 // Canonicalize to ensure consistent path matching
                 let path = canonicalize(&path);
+                log::debug!("auto-reload: register doc_id={:?} path={:?}", doc_id, path);
                 if let Some(ref mut watcher) = self.watcher {
                     if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
-                        log::warn!("Failed to watch file {:?}: {}", path, e);
+                        log::warn!("auto-reload: failed to watch file {:?}: {}", path, e);
                     } else {
                         self.path_to_doc.insert(path.clone(), doc_id);
                         self.doc_to_path.insert(doc_id, path);
                     }
+                } else {
+                    log::warn!("auto-reload: register requested before watcher init");
                 }
                 timeout
             }
             AutoReloadEvent::Unregister { doc_id } => {
+                log::debug!("auto-reload: unregister doc_id={:?}", doc_id);
                 if let Some(path) = self.doc_to_path.remove(&doc_id) {
                     self.path_to_doc.remove(&path);
                     self.pending.remove(&path);
                     if let Some(ref mut watcher) = self.watcher {
                         if let Err(e) = watcher.unwatch(&path) {
-                            log::warn!("Failed to unwatch file {:?}: {}", path, e);
+                            log::warn!("auto-reload: failed to unwatch file {:?}: {}", path, e);
                         }
                     }
                 }
@@ -102,7 +115,9 @@ impl helix_event::AsyncHook for AutoReloadHandler {
             AutoReloadEvent::FileChanged { path } => {
                 // Canonicalize to match how helix stores paths
                 let path = canonicalize(&path);
+                log::trace!("auto-reload: file changed path={:?}", path);
                 if !self.path_to_doc.contains_key(&path) {
+                    log::trace!("auto-reload: ignoring event for unregistered path");
                     return timeout;
                 }
 
@@ -117,6 +132,10 @@ impl helix_event::AsyncHook for AutoReloadHandler {
                 if let Some(&expires) = self.cooldown_expires.get(&path) {
                     if now < expires {
                         // In cooldown - schedule for when cooldown expires
+                        log::trace!(
+                            "auto-reload: in cooldown, scheduling for {:?}",
+                            expires
+                        );
                         return Some(expires);
                     }
                 }
@@ -134,16 +153,21 @@ impl helix_event::AsyncHook for AutoReloadHandler {
         self.cooldown_expires.retain(|_, expires| *expires > now);
 
         let pending: Vec<PathBuf> = self.pending.drain().collect();
+        if !pending.is_empty() {
+            log::debug!("auto-reload: processing {} pending paths", pending.len());
+        }
         for path in pending {
             let path_clone = path.clone();
             job::dispatch_blocking(move |editor, _| {
                 // Check if auto_reload is enabled
                 if !editor.config().auto_reload {
+                    log::debug!("auto-reload: disabled by config, skipping reload");
                     return;
                 }
 
                 // Find the document by path
                 let Some(doc) = editor.document_by_path(&path_clone) else {
+                    log::debug!("auto-reload: no document found for path {:?}", path_clone);
                     return;
                 };
 
@@ -155,6 +179,10 @@ impl helix_event::AsyncHook for AutoReloadHandler {
                         "\"{}\" changed on disk (buffer has unsaved changes)",
                         doc.display_name()
                     ));
+                    log::debug!(
+                        "auto-reload: doc has unsaved changes, skipping reload path={:?}",
+                        path_clone
+                    );
                     return;
                 }
 
@@ -162,6 +190,21 @@ impl helix_event::AsyncHook for AutoReloadHandler {
                 // (skip reload if same - likely our own save)
                 if let Ok(file_content) = std::fs::read_to_string(&path_clone) {
                     if file_content == doc.text().to_string() {
+                        log::trace!(
+                            "auto-reload: content unchanged, re-registering watch"
+                        );
+                        // Atomic replace (temp write + rename) can swap inodes without changing
+                        // content; re-register to keep the watch valid on Linux.
+                        if let Some(path) = doc.path().cloned() {
+                            send_blocking(
+                                &editor.handlers.auto_reload,
+                                AutoReloadEvent::Unregister { doc_id },
+                            );
+                            send_blocking(
+                                &editor.handlers.auto_reload,
+                                AutoReloadEvent::Register { doc_id, path },
+                            );
+                        }
                         return;
                     }
                 }
@@ -169,6 +212,7 @@ impl helix_event::AsyncHook for AutoReloadHandler {
                 // Get a view for this document
                 let view_ids: Vec<_> = doc.selections().keys().cloned().collect();
                 if view_ids.is_empty() {
+                    log::debug!("auto-reload: no views for document, skipping reload");
                     return;
                 }
 
@@ -194,17 +238,34 @@ impl helix_event::AsyncHook for AutoReloadHandler {
                 match reload_result {
                     Ok(()) => {
                         editor.set_status(format!("Reloaded \"{}\"", display_name));
+                        log::info!("auto-reload: reloaded {:?}", doc_path);
 
                         // Notify language servers about the change
-                        if let Some(path) = doc_path {
+                        if let Some(path) = doc_path.clone() {
                             editor
                                 .language_servers
                                 .file_event_handler
                                 .file_changed(path);
                         }
+
+                        // Re-register the watch to handle inode changes on Linux
+                        // When files are atomically replaced (temp write + rename), the inode
+                        // changes and inotify watches become invalid. Re-registering ensures
+                        // we watch the current inode.
+                        if let Some(path) = doc_path {
+                            send_blocking(
+                                &editor.handlers.auto_reload,
+                                AutoReloadEvent::Unregister { doc_id },
+                            );
+                            send_blocking(
+                                &editor.handlers.auto_reload,
+                                AutoReloadEvent::Register { doc_id, path },
+                            );
+                        }
                     }
                     Err(e) => {
                         editor.set_error(format!("Failed to reload: {}", e));
+                        log::warn!("auto-reload: reload failed: {}", e);
                     }
                 }
             });
