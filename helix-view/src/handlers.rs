@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use completion::{CompletionEvent, CompletionHandler};
 use helix_event::send_blocking;
 use tokio::sync::mpsc::Sender;
@@ -17,11 +19,21 @@ pub enum AutoSaveEvent {
     LeftInsertMode,
 }
 
+pub enum AutoReloadEvent {
+    Init {
+        tx: Sender<AutoReloadEvent>,
+    },
+    Register { doc_id: DocumentId, path: PathBuf },
+    Unregister { doc_id: DocumentId },
+    FileChanged { path: PathBuf },
+}
+
 pub struct Handlers {
     // only public because most of the actual implementation is in helix-term right now :/
     pub completions: CompletionHandler,
     pub signature_hints: Sender<lsp::SignatureHelpEvent>,
     pub auto_save: Sender<AutoSaveEvent>,
+    pub auto_reload: Sender<AutoReloadEvent>,
     pub document_colors: Sender<lsp::DocumentColorsEvent>,
     pub word_index: word_index::Handler,
     pub pull_diagnostics: Sender<lsp::PullDiagnosticsEvent>,
